@@ -1256,8 +1256,8 @@ class CodeSandboxSize(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    cpu: Optional[int] = Field(default=None, ge=1, le=64, description="vCPUs.")
-    memory_gb: Optional[int] = Field(default=None, ge=1, le=256, description="Memory in GB.")
+    cpu: Optional[Literal[2, 8]] = Field(default=None, description="vCPUs: 2 or 8.")
+    memory_gb: Optional[Literal[4, 8]] = Field(default=None, description="Memory in GB: 4 or 8.")
 
     @model_validator(mode="after")
     def check_dimension(self) -> "CodeSandboxSize":
@@ -1268,9 +1268,9 @@ class CodeSandboxSize(BaseModel):
 
 _SANDBOX_SIZE_DESCRIPTION = (
     "Optional when type='code' with target='cloud'; ignored for every other type. Initial vCPUs / "
-    "memory of a NEW code session's sandbox; the closest built size that satisfies both is used. "
-    "Omit it to use the project's size or the default. A resumed session keeps the size it holds. "
-    "An unbuilt or over-limit size fails with the available sizes. Disk size is not selectable."
+    "memory of a NEW code session's sandbox: cpu 2 or 8, memory_gb 4 or 8 (a missing one takes the "
+    "default). Omit it to use the project's size or the default (8 vCPU / 8 GB). A resumed session keeps "
+    "the size it holds. An over-limit size fails with the available sizes. Disk size is not selectable."
 )
 
 

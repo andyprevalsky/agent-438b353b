@@ -104,7 +104,7 @@ def test_schema_accepts_a_size_and_refuses_empty_or_disk():
         sized = model(**base, sandbox_size={"cpu": 8})
         assert sized.model_dump()["sandbox_size"] == {"cpu": 8, "memory_gb": None}
         assert model(**base).sandbox_size is None, "omitted: backward compatible"
-        for bad in ({}, {"cpu": 8, "disk_gb": 50}, {"cpu": 0}):
+        for bad in ({}, {"cpu": 8, "disk_gb": 50}, {"cpu": 0}, {"cpu": 4}, {"memory_gb": 16}):
             try:
                 model(**base, sandbox_size=bad)
                 raise AssertionError(f"{model.__name__} accepted {bad}")

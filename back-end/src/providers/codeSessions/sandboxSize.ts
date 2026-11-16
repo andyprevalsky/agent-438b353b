@@ -501,9 +501,9 @@ export class SandboxSizeUnsupportedError extends Error {
 
 /**
  * Validate a spawn's explicit `{cpu?, memoryGb?}`: a missing dimension takes the
- * new-session default; the request must fit the user's cap and some built
- * template must satisfy it (cpu ≥ N, memory ≥ M). Returns the request with both
- * dimensions; the spawn runs on closestAvailableSize of it.
+ * new-session default; the result must fit the user's cap and be exactly a grid
+ * point with a built template (default grid: cpu {2, 8} × memory {4, 8} GB).
+ * Returns the request with both dimensions.
  */
 export async function resolveRequestedSandboxSize(
   provider: SandboxProvider,
@@ -528,9 +528,11 @@ export async function resolveRequestedSandboxSize(
       max
     );
   }
-  if (closestAvailableSize(provider, want) === null) {
+  // Only exact grid points with a built template: an off-grid request is refused,
+  // never rounded up to a bigger (costlier) size.
+  if (!availableSizes(provider).some((size) => sameSize(size, want))) {
     throw new SandboxSizeUnsupportedError(
-      `No ${provider} sandbox of at least ${sizeLabel(want)} is built. Available: ${choices}.`,
+      `Unsupported sandbox size ${sizeLabel(want)}: supported vCPUs ${sandboxGrid().cpu.join(' or ')}, memory ${sandboxGrid().memoryGb.join(' or ')} GB. Available: ${choices}.`,
       want,
       available,
       max ?? want

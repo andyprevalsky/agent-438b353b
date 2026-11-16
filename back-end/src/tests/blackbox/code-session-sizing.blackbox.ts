@@ -199,6 +199,21 @@ test('validation: an unbuilt or over-cap request is refused with the available s
   assert.equal(mapped?.status, 400);
   assert.equal(mapped?.body.code, 'SANDBOX_SIZE_UNSUPPORTED');
   assert.deepEqual(mapped?.body.requested, { cpu: 16, memory_gb: 8 });
+  for (const offGrid of [{ cpu: 4 }, { memoryGb: 6 }, { cpu: 2, memoryGb: 2 }]) {
+    const refused = await resolveRequestedSandboxSize('claude', offGrid, userId).catch(
+      (error: unknown) => error
+    );
+    assert.ok(refused instanceof SandboxSizeUnsupportedError, `${JSON.stringify(offGrid)} refused`);
+    assert.match(refused.message, /supported vCPUs 2 or 8, memory 4 or 8 GB/);
+  }
+  for (const onGrid of [
+    { cpu: 2, memoryGb: 4 },
+    { cpu: 2, memoryGb: 8 },
+    { cpu: 8, memoryGb: 4 },
+    { cpu: 8, memoryGb: 8 },
+  ]) {
+    assert.deepEqual(await resolveRequestedSandboxSize('codex', onGrid, userId), onGrid);
+  }
   const capped = await resolveRequestedSandboxSize('claude', { cpu: 8 }, cappedUserId).catch(
     (error: unknown) => error
   );
