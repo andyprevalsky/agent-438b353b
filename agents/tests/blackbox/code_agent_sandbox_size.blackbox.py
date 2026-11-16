@@ -225,7 +225,11 @@ def test_final_size_reports_requested_initial_resizes_and_unknown():
         to_size={"cpu": 8, "memory_gb": 4},
         applied=False,
         observed={"cpu": 8, "memory_gb": 8},
+        view={"request_id": "rq-2", "error": "TARGET_DISK_CAPACITY: restore needs 30 GB", "request_to_settled_ms": 61_000},
     )
+    assert sizing["resizes"][-1]["request_id"] == "rq-2", sizing
+    assert "last resize settled in 61s" in service.format_sandbox_sizing(sizing)
+    assert "last resize error: TARGET_DISK_CAPACITY" in service.format_sandbox_sizing(sizing)
     assert sizing["final"] == {"cpu": 8, "memory_gb": 8} and sizing["initial"] == {"cpu": 2, "memory_gb": 4}
     assert sizing["resize_count"] == 1 and sizing["resize_failed_count"] == 1 and len(sizing["resizes"]) == 2
     text = service.format_code_session_summary({"code_session_id": "cs-1", "sandbox_sizing": sizing})

@@ -1499,6 +1499,7 @@ async def _apply_sandbox_resize(
         to_size=view.get("to") or request.get("to"),
         applied=applied,
         observed=size,
+        view=view,
     )
     session_record["sandbox_sizing"] = code_agent_meta["sandbox_sizing"]
     title = (
@@ -3353,8 +3354,13 @@ def record_sandbox_resize(
     to_size: Any,
     applied: bool,
     observed: Any,
+    view: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Add one applied or failed resize; ``final`` becomes the size the backend reports after it."""
+    """Add one applied or failed resize; ``final`` becomes the size the backend reports after it.
+
+    ``view`` is the backend's ResizeRequestView: its request id, error (a structured
+    failure code such as HELD_DISK_FULL) and measured request-to-settled time.
+    """
     before = _size_view(from_size)
     updated = dict(
         sizing
@@ -3370,7 +3376,15 @@ def record_sandbox_resize(
     )
     key = "resize_count" if applied else "resize_failed_count"
     updated[key] = int(updated.get(key) or 0) + 1
-    entry = {"from": before, "to": _size_view(to_size), "applied": applied}
+    view = view or {}
+    entry = {
+        "from": before,
+        "to": _size_view(to_size),
+        "applied": applied,
+        "request_id": view.get("request_id"),
+        "error": view.get("error"),
+        "request_to_settled_ms": view.get("request_to_settled_ms"),
+    }
     updated["resizes"] = [*list(updated.get("resizes") or []), entry][-SANDBOX_RESIZE_HISTORY:]
     after = _size_view(observed)
     if after is not None:
@@ -3403,6 +3417,12 @@ def format_sandbox_sizing(sizing: Optional[Dict[str, Any]]) -> str:
     failed = int(sizing.get("resize_failed_count") or 0)
     if applied or failed:
         parts.append(f"resizes: {applied} applied, {failed} failed")
+        last = (sizing.get("resizes") or [{}])[-1]
+        took = last.get("request_to_settled_ms")
+        if isinstance(took, (int, float)) and not isinstance(took, bool):
+            parts.append(f"last resize settled in {took / 1000:.0f}s")
+        if not last.get("applied") and last.get("error"):
+            parts.append(f"last resize error: {str(last['error'])[:200]}")
     return "; ".join(parts)
 
 

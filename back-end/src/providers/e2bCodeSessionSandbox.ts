@@ -19,8 +19,8 @@ import type {
   ProjectTemplateSnapshot,
   ProjectWorkspace,
 } from './projects/types';
+import { moveToResizedSandbox } from './codeSessions/resizeMove';
 import {
-  checkpointCodeSession,
   connectPausedSandbox,
   prepareLocalCodeSessionHome,
   restoreLatestCheckpoint,
@@ -108,17 +108,17 @@ export interface SpawnSizing {
  * checkpoint restored into it before the ws-server starts.
  *
  * C16: when the spawn wants another size than the held sandbox has, the held
- * sandbox is checkpointed, a new one of the wanted size restores it, and only
- * then is the held one killed. A failed save or restore keeps the held
- * sandbox (paused) and throws, so nothing is lost.
+ * sandbox is checkpointed, a new one of the wanted size restores exactly that
+ * checkpoint and is validated, and only then does the row move to it
+ * (codeSessions/resizeMove.ts). A failed save, restore or validation keeps the
+ * held sandbox (paused) and throws, so nothing is lost.
  */
 export async function acquireCodeSessionSandbox(
   codeSession: CodeSessionRow | null,
   create: () => Promise<Sandbox>,
   sizing: SpawnSizing = {}
 ): Promise<{ sandbox: Sandbox; resumedFrom: ResumedFrom; cliSessionId: string | null }> {
-  let session = codeSession;
-  let replaced: Sandbox | null = null;
+  const session = codeSession;
   if (session?.sandboxKind === 'e2b' && session.sandboxId !== null) {
     const sandboxId = session.sandboxId;
     const resume = () => connectPausedSandbox(sandboxId, SANDBOX_TIMEOUT_MS);
@@ -137,23 +137,17 @@ export async function acquireCodeSessionSandbox(
         };
       }
       await stopStaleWsServer(resumed);
-      session = await saveBeforeResize(session, resumed, sizing);
-      replaced = resumed;
+      const moved = await moveToResizedSandbox(session, resumed, create, sizing);
+      return { ...moved, resumedFrom: 'checkpoint' };
     }
   }
   const sandbox = await create();
   if (session !== null && session.latestCheckpointSeq > 0) {
     const restored = await restoreLatestCheckpoint(session, e2bSandboxFs(sandbox));
     if (restored !== null) {
-      if (replaced !== null) await retireReplacedSandbox(session, sandbox, replaced, sizing);
-      else await recordNewSandbox(session, sandbox, sizing);
+      await recordNewSandbox(session, sandbox, sizing);
       return { sandbox, resumedFrom: 'checkpoint', cliSessionId: restored.cliSessionId };
     }
-  }
-  if (replaced !== null) {
-    await sandbox.kill().catch(() => undefined);
-    await replaced.pause().catch(() => undefined);
-    throw new Error('The saved session could not be restored into the new sandbox size');
   }
   if (session !== null) await recordNewSandbox(session, sandbox, sizing);
   return { sandbox, resumedFrom: 'new', cliSessionId: null };
@@ -171,57 +165,6 @@ async function recordNewSandbox(
     sandboxId: sandbox.sandboxId,
     size: sizing.size,
   });
-}
-
-/** Checkpoint the held sandbox before moving to another size; the row now names that checkpoint. */
-async function saveBeforeResize(
-  session: CodeSessionRow,
-  held: Sandbox,
-  sizing: SpawnSizing
-): Promise<CodeSessionRow> {
-  const checkpoint = await checkpointCodeSession({
-    session,
-    fs: e2bSandboxFs(held),
-    reason: 'resize',
-    agentId: sizing.agentId ?? session.ownerAgentId,
-  });
-  if (checkpoint === null) {
-    await held.pause().catch(() => undefined);
-    throw new Error('The session could not be saved before moving it to another sandbox size');
-  }
-  return {
-    ...session,
-    latestCheckpointSeq: Math.max(session.latestCheckpointSeq, checkpoint.seq),
-    cliSessionId: checkpoint.cliSessionId ?? session.cliSessionId,
-  };
-}
-
-/** The new-size sandbox holds the session now: record it, then kill the old one. */
-async function retireReplacedSandbox(
-  session: CodeSessionRow,
-  sandbox: Sandbox,
-  replaced: Sandbox,
-  sizing: SpawnSizing
-): Promise<void> {
-  await recordSandbox(session.id, {
-    sandboxKind: 'e2b',
-    sandboxId: sandbox.sandboxId,
-    ...(sizing.size !== undefined ? { size: sizing.size } : {}),
-  });
-  try {
-    await replaced.kill();
-    log.info('Replaced the code-session sandbox with a resized one', {
-      codeSessionId: session.id,
-      previous: replaced.sandboxId,
-      sandboxId: sandbox.sandboxId,
-    });
-  } catch (error) {
-    log.warn('Killing the replaced code-session sandbox failed', {
-      codeSessionId: session.id,
-      sandboxId: replaced.sandboxId,
-      error: error instanceof Error ? error.message : String(error),
-    });
-  }
 }
 
 /** Caller identity may supply a new spawn owner but never replace session authority. */
