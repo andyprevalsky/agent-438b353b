@@ -24,6 +24,7 @@ import {
 import { classifyLoginRejection } from '../../providers/codeLoginRejection';
 import { markAnthropicApiKeyOnCooldown } from '../../providers/computeCredentials';
 import { createWithCodeSession } from '../../providers/codeSessions/spawn';
+import { requestedSandboxSize, type SandboxSize } from '../../providers/codeSessions/sandboxSize';
 
 export { checkSandboxHealth, type HealthCheckResult } from './health';
 
@@ -123,9 +124,11 @@ export async function resolveAgentContext(
 function sessionOptions(
   params: CreateSessionParams,
   projectWorkspace: ClaudeCodeSessionOptions['projectWorkspace'],
-  codeSession: ClaudeCodeSessionOptions['codeSession']
+  codeSession: ClaudeCodeSessionOptions['codeSession'],
+  sandboxSize: SandboxSize | null
 ): ClaudeCodeSessionOptions {
   return {
+    sandboxSize,
     projectWorkspace,
     codeSession,
     freshConversation: params.fresh_conversation === true,
@@ -152,6 +155,13 @@ function sessionWorkspace(
   });
 }
 
+/** The agent's owner and repo, and the spawn's validated sandbox size (400 when unsatisfiable). */
+async function resolveSpawnContext(params: CreateSessionParams) {
+  const resolved = await resolveAgentContext(params.agent_id, params.user_id);
+  const sandboxSize = await requestedSandboxSize('claude', params.sandbox_size, resolved.userId);
+  return { resolved, sandboxSize };
+}
+
 export async function createSession(params: CreateSessionParams): Promise<CreateSessionResult> {
   const { agent_id, goal, attachments, user_id } = params;
   let effectiveGithubRepoUrl = params.github_repo_url;
@@ -160,7 +170,7 @@ export async function createSession(params: CreateSessionParams): Promise<Create
   // The agents service does not need to duplicate the user ID on every internal
   // code-session request. Resolve ownership from the authoritative Agent row so
   // repo-less agents can still consume their user's stored OAuth credential.
-  const resolved = await resolveAgentContext(agent_id, effectiveUserId);
+  const { resolved, sandboxSize } = await resolveSpawnContext(params);
   effectiveUserId = resolved.userId;
   const workspace = await sessionWorkspace(params, resolved);
   const { projectWorkspace, repoOverrideUrl } = workspace;
@@ -235,7 +245,7 @@ export async function createSession(params: CreateSessionParams): Promise<Create
         normalizedRepoUrl,
         effectiveUserId,
         fastModeCacheEnabled,
-        sessionOptions(params, projectWorkspace, codeSession)
+        sessionOptions(params, projectWorkspace, codeSession, sandboxSize)
       )
   );
 

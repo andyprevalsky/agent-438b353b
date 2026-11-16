@@ -1493,6 +1493,14 @@ async def _apply_sandbox_resize(
     if size is not None:
         code_agent_meta["sandbox_size"] = size
     view = resized.get("request") if isinstance(resized.get("request"), dict) else {}
+    code_agent_meta["sandbox_sizing"] = record_sandbox_resize(
+        code_agent_meta.get("sandbox_sizing"),
+        from_size=view.get("from") or request.get("from"),
+        to_size=view.get("to") or request.get("to"),
+        applied=applied,
+        observed=size,
+    )
+    session_record["sandbox_sizing"] = code_agent_meta["sandbox_sizing"]
     title = (
         f"Environment resized to {_size_label(size)}"
         if applied
@@ -3302,6 +3310,110 @@ def format_usage_limit_user_message(
     return f"Paused: {provider} usage limit reached{resets}. {saved}"
 
 
+# Resize entries kept in sandbox_sizing (the counts stay exact past it).
+SANDBOX_RESIZE_HISTORY = 10
+
+
+def _size_view(value: Any) -> Optional[Dict[str, int]]:
+    """``{cpu, memory_gb}`` when both are positive ints, else None (unknown)."""
+    if not isinstance(value, dict):
+        return None
+    cpu, memory = value.get("cpu"), value.get("memory_gb")
+    valid = all(isinstance(v, int) and not isinstance(v, bool) and v > 0 for v in (cpu, memory))
+    return {"cpu": cpu, "memory_gb": memory} if valid else None
+
+
+def initial_sandbox_sizing(session_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Requested vs observed size from a create response; None for a sessionless (local) start.
+
+    ``requested`` is the spawn's explicit sandbox_size, ``initial`` the size the
+    sandbox started on, ``final`` the latest size Rose recorded for it (resizes
+    update it), ``source`` where the initial size came from. Unknown is None.
+    """
+    reported = session_data.get("sandbox_sizing") if isinstance(session_data.get("sandbox_sizing"), dict) else {}
+    size = _size_view(session_data.get("sandbox_size"))
+    if not reported and size is None:
+        return None
+    initial = _size_view(reported.get("initial")) or size
+    return {
+        "requested": _size_view(reported.get("requested")),
+        "initial": initial,
+        "final": size or initial,
+        "source": reported.get("source") or "unknown",
+        "resize_count": 0,
+        "resize_failed_count": 0,
+        "resizes": [],
+    }
+
+
+def record_sandbox_resize(
+    sizing: Optional[Dict[str, Any]],
+    *,
+    from_size: Any,
+    to_size: Any,
+    applied: bool,
+    observed: Any,
+) -> Dict[str, Any]:
+    """Add one applied or failed resize; ``final`` becomes the size the backend reports after it."""
+    before = _size_view(from_size)
+    updated = dict(
+        sizing
+        or {
+            "requested": None,
+            "initial": before,
+            "final": before,
+            "source": "unknown",
+            "resize_count": 0,
+            "resize_failed_count": 0,
+            "resizes": [],
+        }
+    )
+    key = "resize_count" if applied else "resize_failed_count"
+    updated[key] = int(updated.get(key) or 0) + 1
+    entry = {"from": before, "to": _size_view(to_size), "applied": applied}
+    updated["resizes"] = [*list(updated.get("resizes") or []), entry][-SANDBOX_RESIZE_HISTORY:]
+    after = _size_view(observed)
+    if after is not None:
+        updated["final"] = after
+    elif applied:
+        # Applied but no size reported: the old size is no longer true.
+        updated["final"] = None
+    return updated
+
+
+def _size_text(size: Any) -> str:
+    view = _size_view(size)
+    return f"{view['cpu']} vCPU / {view['memory_gb']} GB" if view else "unknown"
+
+
+def format_sandbox_sizing(sizing: Optional[Dict[str, Any]]) -> str:
+    """One line for the tool result: final vs initial vs requested size, provenance, resizes."""
+    if not isinstance(sizing, dict):
+        return ""
+    parts = [
+        f"Sandbox size: {_size_text(sizing.get('final'))} at the end",
+        f"started at {_size_text(sizing.get('initial'))} (source: {sizing.get('source') or 'unknown'})",
+    ]
+    requested = _size_view(sizing.get("requested"))
+    if requested is not None:
+        parts.append(f"requested {_size_text(requested)}")
+        if sizing.get("source") in ("session", "resize", "legacy"):
+            parts.append("not applied: a resumed session keeps the size it holds (`rose env size` changes it)")
+    applied = int(sizing.get("resize_count") or 0)
+    failed = int(sizing.get("resize_failed_count") or 0)
+    if applied or failed:
+        parts.append(f"resizes: {applied} applied, {failed} failed")
+    return "; ".join(parts)
+
+
+def _with_sandbox_sizing(facts: Optional[Dict[str, Any]], code_agent_meta: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The facts with the run's sandbox sizing attached (the parent and resumes see it)."""
+    sizing = code_agent_meta.get("sandbox_sizing")
+    if facts is None or not isinstance(sizing, dict):
+        return facts
+    return {**facts, "sandbox_sizing": sizing}
+
+
 def format_code_session_summary(facts: Optional[Dict[str, Any]]) -> str:
     """One factual block for the tool result: session, branch, commits, PR, merged."""
     if not facts or not facts.get("code_session_id"):
@@ -3330,6 +3442,9 @@ def format_code_session_summary(facts: Optional[Dict[str, Any]]) -> str:
             lines.append("Merged: unknown (GitHub could not be reached)")
         else:
             lines.append(f"Merged: {'yes' if facts.get('merged') else 'no'} (confirmed with GitHub)")
+    sizing = format_sandbox_sizing(facts.get("sandbox_sizing"))
+    if sizing:
+        lines.append(sizing)
     return "\n".join(lines)
 
 
@@ -3470,6 +3585,9 @@ def code_session_failure_error(
     ]
     if (facts or {}).get("branch"):
         lines.append(f"Branch: {facts['branch']}")
+    sizing = format_sandbox_sizing((facts or {}).get("sandbox_sizing"))
+    if sizing:
+        lines.append(sizing)
     lines.append(
         f"Resume it with spawn_agent(type='code', code_session_id='{code_session_id}', goal=<the same goal>)."
     )
@@ -3691,6 +3809,8 @@ async def spawn_claude_code_activity(
         code_agent_meta["title"] = task_name
     if isinstance(attached, dict) and isinstance(attached.get("sandbox_size"), dict):
         code_agent_meta["sandbox_size"] = attached["sandbox_size"]
+    if isinstance(attached, dict) and isinstance(attached.get("sandbox_sizing"), dict):
+        code_agent_meta["sandbox_sizing"] = attached["sandbox_sizing"]
 
     logger.info(
         "[ClaudeCode] Using response schema from tool call",
@@ -3824,6 +3944,7 @@ async def spawn_claude_code_activity(
                 local_device_id=local_device_id,
                 fresh_conversation=(code_session_request or {}).get("fresh_conversation") is True,
                 task_name=(code_session_request or {}).get("task_name"),
+                sandbox_size=(code_session_request or {}).get("sandbox_size"),
                 cli_settings=(code_session_request or {}).get("cli_settings"),
                 resume_config={
                     "source_code_provider": source_code_provider,
@@ -3855,6 +3976,11 @@ async def spawn_claude_code_activity(
             if isinstance(session_data.get("sandbox_size"), dict):
                 # vCPUs / memory of the E2B sandbox (C16).
                 code_agent_meta["sandbox_size"] = session_data["sandbox_size"]
+            sizing = initial_sandbox_sizing(session_data)
+            if sizing is not None:
+                # Requested vs observed size and its provenance (reported on every end path).
+                code_agent_meta["sandbox_sizing"] = sizing
+                code_session_facts = _with_sandbox_sizing(code_session_facts, code_agent_meta)
             if isinstance(session_data.get("startup"), dict):
                 # How long the sandbox's ws-server took to serve and its repo clone
                 # ({ws_ready_ms, clone_ms}); the code-agent benchmark reads it.
@@ -3893,13 +4019,17 @@ async def spawn_claude_code_activity(
             "transcript_events": max(int((attached or {}).get("transcript_events") or 0), history_events),
             "preview_url": code_agent_meta.get("preview_url"),
             "sandbox_size": code_agent_meta.get("sandbox_size"),
+            "sandbox_sizing": code_agent_meta.get("sandbox_sizing"),
         }
         if code_session_facts is None and code_session_id:
-            code_session_facts = {
-                "code_session_id": code_session_id,
-                "branch": session_record["branch"],
-                "merge_target": session_record["merge_target"],
-            }
+            code_session_facts = _with_sandbox_sizing(
+                {
+                    "code_session_id": code_session_id,
+                    "branch": session_record["branch"],
+                    "merge_target": session_record["merge_target"],
+                },
+                code_agent_meta,
+            )
         if target == "local":
             # A drained/retried attempt must reattach to the same Mac, never the cloud.
             session_record.update(

@@ -28,11 +28,13 @@ import {
 } from './codeSessions/lifecycle';
 import {
   heldSandboxSize,
+  maxSizeFor,
   resolveSpawnSandbox,
   sameSize,
   defaultSandboxSize,
   type SandboxProvider,
   type SandboxSize,
+  type SandboxSizeSource,
 } from './codeSessions/sandboxSize';
 import { e2bSandboxFs, localSandboxFs } from './codeSessions/sandboxFs';
 import { writeHandoffTrajectory, type SpawnCodeSession } from './codeSessions/usageLimit';
@@ -77,6 +79,8 @@ export interface CodeAgentSessionResult {
   previewUrl?: string | null;
   /** vCPUs / memory of the E2B sandbox (C16); absent for local sessions. */
   sandboxSize?: SandboxSize | null;
+  /** The spawn's explicit size request and where the sandbox's size came from. */
+  sandboxSizing?: SpawnSizingReport | null;
   /** Attached to a live CLI: its events before this spawn's goal are history. */
   historyEvents?: number;
   /** How long the ws-server took to serve, and the repo clone inside that (null: none). */
@@ -84,6 +88,12 @@ export interface CodeAgentSessionResult {
 }
 
 export type { ClaudeCodeSessionOptions } from './codeSessionLaunchOptions';
+
+/** What a spawn asked for and where its sandbox's size came from (requested vs observed). */
+export interface SpawnSizingReport {
+  requested: SandboxSize | null;
+  source: SandboxSizeSource | null;
+}
 
 /** Sizing of a spawn (C16): the size it wants and the agent to attribute checkpoints to. */
 export interface SpawnSizing {
@@ -240,6 +250,8 @@ export async function acquireCodeSandbox(
   sizing: {
     provider?: SandboxProvider;
     projectSize?: unknown;
+    /** The spawn's explicit, validated size (resolveRequestedSandboxSize); a new session only. */
+    requestedSize?: SandboxSize | null;
     agentId?: string;
     userId?: string;
     /**
@@ -254,18 +266,23 @@ export async function acquireCodeSandbox(
   resumedFrom: ResumedFrom;
   cliSessionId: string | null;
   size?: SandboxSize;
+  /** Where the size came from (null: unsized spawn). */
+  sizeSource?: SandboxSizeSource | null;
+  /** The size facts a spawn result reports (spread into CodeAgentSessionResult). */
+  reported: Pick<CodeAgentSessionResult, 'sandboxSize' | 'sandboxSizing'>;
   /** The sandbox was created from the project's template snapshot. */
   fromSnapshot: boolean;
 }> {
   const userId = codeSandboxUserId(codeSession, sizing.userId);
   const sized =
     sizing.provider !== undefined
-      ? await resolveSpawnSandbox(
-          codeSession,
-          sizing.provider,
-          sizing.project?.sandboxSize ?? sizing.projectSize ?? null
-        )
+      ? await resolveSpawnSandbox(codeSession, sizing.provider, {
+          requested: sizing.requestedSize ?? null,
+          projectSize: sizing.project?.sandboxSize ?? sizing.projectSize ?? null,
+          ...(userId ? { max: await maxSizeFor(userId) } : {}),
+        })
       : null;
+  const sizeSource: SandboxSizeSource | null = sized?.source ?? null;
   const spawnSizing: SpawnSizing = {
     ...(sized !== null ? { size: sized.size } : {}),
     agentId: sizing.agentId,
@@ -293,6 +310,13 @@ export async function acquireCodeSandbox(
     codeSession,
     async () => {
       const snapshot = sizing.snapshot ?? sizing.project?.templateSnapshot ?? null;
+      // A snapshot of another size than the spawn resolved (an explicit request,
+      // or a default raised since the snapshot was built) would silently override
+      // it; such a spawn starts from the sized base template instead, and the
+      // project's next template sync rebuilds the snapshot (maintenanceRunner).
+      const snapshotFits =
+        snapshot !== null &&
+        (snapshot.size === null || sized === null || sameSize(snapshot.size, sized.size));
       // Project maintenance builds Claude images (maintenanceE2b.ts). A Codex
       // ws-server overlay cannot supply the missing Codex binary; its workspace
       // must instead be restored onto the Codex provider's own image.
@@ -300,6 +324,7 @@ export async function acquireCodeSandbox(
       if (
         sizing.provider === 'claude' &&
         snapshot !== null &&
+        snapshotFits &&
         (codeSession === null || codeSession.sandboxId === null)
       ) {
         try {
@@ -349,6 +374,11 @@ export async function acquireCodeSandbox(
   return {
     ...acquired,
     ...(spawnSizing.size !== undefined ? { size: spawnSizing.size } : {}),
+    sizeSource,
+    reported: {
+      sandboxSize: spawnSizing.size,
+      sandboxSizing: { requested: sizing.requestedSize ?? null, source: sizeSource },
+    },
     fromSnapshot,
   };
 }

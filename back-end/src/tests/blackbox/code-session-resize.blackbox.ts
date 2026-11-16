@@ -500,9 +500,12 @@ test('the default grid offers 4 and 8 GB and refuses 16 GB (E2B team cap of 8192
     const fresh = await prisma.codeSession.create({
       data: { userId, rootAgentId: agentId, ownerAgentId: agentId, repoKey: `g-${randomUUID()}` },
     });
-    assert.deepEqual(await resolveSpawnSandbox(fresh, 'codex', null), {
-      size: { cpu: 2, memoryGb: 4 },
-      templateId: sizedTemplateName('codex', { cpu: 2, memoryGb: 4 }),
+    // A new session takes the new-session default (8 vCPU / 8 GB when built).
+    assert.deepEqual(await resolveSpawnSandbox(fresh, 'codex', {}), {
+      size: { cpu: 8, memoryGb: 8 },
+      templateId: sizedTemplateName('codex', { cpu: 8, memoryGb: 8 }),
+      wanted: { cpu: 8, memoryGb: 8 },
+      source: 'default',
     });
   } finally {
     process.env.E2B_SANDBOX_TEMPLATES = JSON.stringify(TEMPLATES);
@@ -614,10 +617,18 @@ test('project sandboxSize is the default size of a new session', async () => {
   const fresh = await prisma.codeSession.create({
     data: { userId, rootAgentId: agentId, ownerAgentId: agentId, repoKey: `p-${randomUUID()}` },
   });
-  const sized = await resolveSpawnSandbox(fresh, 'claude', stored.sandboxSize);
-  assert.deepEqual(sized, { size: { cpu: 2, memoryGb: 8 }, templateId: 'tpl-c2-m8' });
+  // A project's partial size fills the missing dimension from the new-session default.
+  const sized = await resolveSpawnSandbox(fresh, 'claude', { projectSize: stored.sandboxSize });
+  assert.deepEqual(sized, {
+    size: { cpu: 8, memoryGb: 8 },
+    templateId: 'tpl-c8-m8',
+    wanted: { cpu: 8, memoryGb: 8 },
+    source: 'project',
+  });
   const { session } = await sessionWithTask();
-  const existing = await resolveSpawnSandbox(session, 'claude', stored.sandboxSize);
+  const existing = await resolveSpawnSandbox(session, 'claude', {
+    projectSize: stored.sandboxSize,
+  });
   assert.deepEqual(existing.size, { cpu: 2, memoryGb: 4 }, 'an existing session keeps its size');
 
   const cleared = await http('PUT', `/api/projects/${project.id}`, { body: { sandboxSize: null } });

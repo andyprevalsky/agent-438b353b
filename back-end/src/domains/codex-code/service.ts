@@ -14,6 +14,8 @@ import { createLogger } from '../../providers/logger';
 import { codexSpeedFor } from '../../providers/codexSpeed';
 
 import { createWithCodeSession } from '../../providers/codeSessions/spawn';
+import { requestedSandboxSize, type SandboxSize } from '../../providers/codeSessions/sandboxSize';
+import type { CodexCodeSessionOptions } from '../../providers/codeSessionLaunchOptions';
 
 export type { HealthCheckResult } from './health';
 export { checkSandboxHealth } from './health';
@@ -121,12 +123,34 @@ async function sessionWorkspace(params: CreateSessionParams, userId: string) {
   });
 }
 
+/** The spawn's Codex launch options (harness, project, CLI conversation, title, size). */
+function launchOptions(
+  params: CreateSessionParams,
+  projectWorkspace: CodexCodeSessionOptions['projectWorkspace'],
+  sandboxSize: SandboxSize | null
+): CodexCodeSessionOptions {
+  return {
+    harnessMode: params.harness_mode,
+    roseApiBaseUrl: params.rose_api_base_url,
+    memoryEnabled: params.memory_enabled,
+    freshConversation: params.fresh_conversation === true,
+    projectWorkspace,
+    taskName: params.task_name ?? null,
+    cliSettings: params.cli_settings ?? null,
+    resumeConfig: params.resume_config,
+    leaseOwner: params.lease_owner,
+    sandboxSize,
+  };
+}
+
 export async function createSession(params: CreateSessionParams) {
   const { agent_id, goal, attachments, user_id } = params;
   if (!user_id) throw new MissingUserIdError();
 
   let effectiveGithubRepoUrl = params.github_repo_url;
   let effectiveUserId = user_id;
+  // Before any repo or sandbox work: an unsatisfiable size fails the spawn with 400.
+  const sandboxSize = await requestedSandboxSize('codex', params.sandbox_size, user_id);
 
   // A project session restores the project's checkout; never also clone a repo.
   const workspace = await sessionWorkspace(params, effectiveUserId);
@@ -186,17 +210,7 @@ export async function createSession(params: CreateSessionParams) {
         normalizedRepoUrl,
         effectiveUserId,
         codexSpeed,
-        {
-          harnessMode: params.harness_mode,
-          roseApiBaseUrl: params.rose_api_base_url,
-          memoryEnabled: params.memory_enabled,
-          freshConversation: params.fresh_conversation === true,
-          projectWorkspace,
-          taskName: params.task_name ?? null,
-          cliSettings: params.cli_settings ?? null,
-          resumeConfig: params.resume_config,
-          leaseOwner: params.lease_owner,
-        },
+        launchOptions(params, projectWorkspace, sandboxSize),
         codeSession
       )
   );

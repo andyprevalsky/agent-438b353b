@@ -368,6 +368,7 @@ async function createClaudeCodeSessionUnlocked(
       provider: 'claude',
       userId,
       project: projectWorkspace?.project,
+      requestedSize: options.sandboxSize ?? null,
       agentId,
     });
   } catch (err) {
@@ -438,7 +439,7 @@ async function createClaudeCodeSessionUnlocked(
         cliSessionId,
         projectRestore: null,
         previewUrl,
-        sandboxSize: acquired.size,
+        ...acquired.reported,
         historyEvents: live.historyEvents ?? 0,
       };
     }
@@ -503,7 +504,7 @@ async function createClaudeCodeSessionUnlocked(
     cliSessionId,
     projectRestore: project.report,
     previewUrl,
-    sandboxSize: acquired.size,
+    ...acquired.reported,
     startup: { wsReadyMs: ws.elapsedMs, cloneMs: ws.cloneMs },
   };
 }
@@ -627,6 +628,7 @@ export async function createCodexCodeSession(
     provider: 'codex',
     userId,
     project: projectWorkspace?.project,
+    requestedSize: harnessOptions?.sandboxSize ?? null,
     agentId,
   });
   const { sandbox, resumedFrom, cliSessionId } = acquired;
@@ -714,7 +716,7 @@ export async function createCodexCodeSession(
     cliSessionId,
     projectRestore: project.report,
     previewUrl,
-    sandboxSize: acquired.size,
+    ...acquired.reported,
     startup: { wsReadyMs: ws.elapsedMs, cloneMs: ws.cloneMs },
   };
 }

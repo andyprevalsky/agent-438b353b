@@ -9,6 +9,7 @@ import { createSandboxWithRetry } from '../e2bSandboxCreate';
 import { CLAUDE_CODE_TEMPLATE, DEFAULT_CLAUDE_CODE_TEMPLATE_ID } from '../claudeCodeTemplate';
 import {
   closestAvailableSize,
+  newSessionDefaultSize,
   parseSandboxSize,
   sandboxTemplateFor,
   type SandboxSize,
@@ -23,11 +24,17 @@ import { E2B_HOME } from './workspace';
  */
 export const MIN_TEMPLATE_SANDBOX: SandboxSize = { cpu: 2, memoryGb: 4 };
 
+/**
+ * The project's chosen size, else the new-session default (so the snapshot a
+ * new session starts from has the size it would get anyway), never below
+ * MIN_TEMPLATE_SANDBOX.
+ */
 export function wantedTemplateSize(project: Pick<MaintenanceProject, 'sandboxSize'>): SandboxSize {
-  const chosen = parseSandboxSize(project.sandboxSize);
+  const fallback = newSessionDefaultSize('claude');
+  const chosen = parseSandboxSize(project.sandboxSize, fallback) ?? fallback;
   return {
-    cpu: Math.max(MIN_TEMPLATE_SANDBOX.cpu, chosen?.cpu ?? 0),
-    memoryGb: Math.max(MIN_TEMPLATE_SANDBOX.memoryGb, chosen?.memoryGb ?? 0),
+    cpu: Math.max(MIN_TEMPLATE_SANDBOX.cpu, chosen.cpu),
+    memoryGb: Math.max(MIN_TEMPLATE_SANDBOX.memoryGb, chosen.memoryGb),
   };
 }
 

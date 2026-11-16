@@ -23,8 +23,13 @@
  *            └─ failure → FAILED, continue on the old size with a turn that says so
  *   a session with no attached activity applies a PENDING request on its next spawn.
  *
- * Size of a new session: its Project's `sandboxSize` {cpu, memoryGb}, else the
- * deployment default. The local Mac target has no size (not applicable).
+ * Size of a new session (newSessionSize): the spawn's explicit `sandbox_size`
+ * (root-selected, validated by resolveRequestedSandboxSize), else its Project's
+ * `sandboxSize` {cpu, memoryGb}, else the new-session default: the operator's
+ * CODE_SANDBOX_DEFAULT_* when set, else PREFERRED_DEFAULT_SANDBOX_SIZE (8 vCPU,
+ * 8 GB) when that template is built and within the user's cap, else the base
+ * size. A session that already holds a sandbox keeps its size; only a resize
+ * request moves it. The local Mac target has no size (not applicable).
  *
  * This file is the size model (grid, templates, caps, the size a spawn wants);
  * sandboxResize.ts holds the request guards and the apply flow.
@@ -33,6 +38,7 @@
  * RESIZE_HISTORY rows of that session's own resize history (indexed by
  * codeSessionId); keepalive adds one indexed read. No shared row or counter.
  */
+import { z } from 'zod';
 import { prisma } from '../database';
 import { createLogger } from '../logger';
 import { isRoseDevUser } from '../../utils/roseDevAccess';
@@ -132,7 +138,11 @@ function intEnv(name: string): number | null {
   return Number.isInteger(value) && value > 0 ? value : null;
 }
 
-/** CODE_SANDBOX_DEFAULT_CPU / _MEMORY_GB (on the grid), else the grid's smallest point. */
+/**
+ * The base size: CODE_SANDBOX_DEFAULT_CPU / _MEMORY_GB (on the grid), else the
+ * grid's smallest point. It is the size of the unsized template and of
+ * sessions from before C16; a new session uses newSessionDefaultSize.
+ */
 export function defaultSandboxSize(): SandboxSize {
   const grid = sandboxGrid();
   const smallest = { cpu: grid.cpu[0], memoryGb: grid.memoryGb[0] };
@@ -143,7 +153,37 @@ export function defaultSandboxSize(): SandboxSize {
   return onGrid(configured) ? configured : smallest;
 }
 
-/** Size of the sandbox a session holds (sessions from before C16 hold the default size). */
+/**
+ * Default size of a new session when neither the spawn nor its project chose
+ * one. 8 vCPU / 8 GB templates are built and ready for both providers
+ * (E2B template list, 2026-11-16); 8 GB is E2B's per-template memory cap.
+ */
+export const PREFERRED_DEFAULT_SANDBOX_SIZE: SandboxSize = { cpu: 8, memoryGb: 8 };
+
+function fitsWithin(size: SandboxSize, max: SandboxSize): boolean {
+  return size.cpu <= max.cpu && size.memoryGb <= max.memoryGb;
+}
+
+/**
+ * New-session default (no spawn or project choice): an operator-set
+ * CODE_SANDBOX_DEFAULT_* wins; else PREFERRED_DEFAULT_SANDBOX_SIZE when its
+ * template is built for `provider` and it fits `max` (the user's cap); else
+ * the base size. Never a size without a built template.
+ */
+export function newSessionDefaultSize(provider: SandboxProvider, max?: SandboxSize): SandboxSize {
+  const base = defaultSandboxSize();
+  if (
+    intEnv('CODE_SANDBOX_DEFAULT_CPU') !== null ||
+    intEnv('CODE_SANDBOX_DEFAULT_MEMORY_GB') !== null
+  ) {
+    return base;
+  }
+  const preferred = PREFERRED_DEFAULT_SANDBOX_SIZE;
+  const built = sandboxTemplateFor(provider, preferred) !== null;
+  return built && (max === undefined || fitsWithin(preferred, max)) ? { ...preferred } : base;
+}
+
+/** Size of the sandbox a session holds (sessions from before C16 hold the base size). */
 export function heldSandboxSize(
   session: Pick<CodeSessionRow, 'sandboxCpu' | 'sandboxMemoryGb'>
 ): SandboxSize {
@@ -158,12 +198,14 @@ function isDimension(value: unknown): value is number {
   return Number.isInteger(value) && (value as number) > 0;
 }
 
-/** A stored `{cpu?, memoryGb?}` (project default); a missing dimension takes the default. */
-export function parseSandboxSize(value: unknown): SandboxSize | null {
+/** A stored `{cpu?, memoryGb?}` (project default); a missing dimension takes `fallback`. */
+export function parseSandboxSize(
+  value: unknown,
+  fallback: SandboxSize = defaultSandboxSize()
+): SandboxSize | null {
   if (typeof value !== 'object' || value === null) return null;
   const { cpu, memoryGb } = value as { cpu?: unknown; memoryGb?: unknown };
   if (!isDimension(cpu) && !isDimension(memoryGb)) return null;
-  const fallback = defaultSandboxSize();
   return {
     cpu: isDimension(cpu) ? cpu : fallback.cpu,
     memoryGb: isDimension(memoryGb) ? memoryGb : fallback.memoryGb,
@@ -320,36 +362,72 @@ export async function activeResizeFor(
 }
 
 /**
+ * Where a spawn's size came from: `request` (the spawn's explicit sandbox_size),
+ * `project` (its Project's sandboxSize), `default` (the new-session default),
+ * `resize` (an active resize request), `session` (the size the session holds),
+ * `legacy` (a session from before C16, on the base size).
+ */
+export type SandboxSizeSource = 'request' | 'project' | 'default' | 'resize' | 'session' | 'legacy';
+
+/** A spawn's sizing inputs: its explicit request and its project's stored size. */
+export interface SpawnSizeChoice {
+  requested?: SandboxSize | null;
+  projectSize?: unknown;
+  /** The user's cap; the new-session default never exceeds it. */
+  max?: SandboxSize;
+}
+
+/** Size of a brand-new session: the request, else the project's size, else the default. */
+export function newSessionSize(
+  provider: SandboxProvider,
+  choice: SpawnSizeChoice
+): { size: SandboxSize; source: SandboxSizeSource } {
+  const fallback = newSessionDefaultSize(provider, choice.max);
+  if (choice.requested) return { size: choice.requested, source: 'request' };
+  const project = parseSandboxSize(choice.projectSize, fallback);
+  return project !== null
+    ? { size: project, source: 'project' }
+    : { size: fallback, source: 'default' };
+}
+
+/**
  * Size a spawn of this session should run on: an active resize request's
  * target, else the size the session already holds; a brand-new session takes
- * its project's default size.
+ * the spawn's request, its project's size or the new-session default.
  */
 export async function wantedSessionSize(
   session: CodeSessionRow | null,
-  projectSize: unknown
-): Promise<SandboxSize> {
-  const fallback = parseSandboxSize(projectSize) ?? defaultSandboxSize();
-  if (session === null) return fallback;
+  provider: SandboxProvider,
+  choice: SpawnSizeChoice
+): Promise<{ size: SandboxSize; source: SandboxSizeSource }> {
+  if (session === null) return newSessionSize(provider, choice);
   const active = await activeResizeFor(session.id);
-  if (active !== null) return toSize(active);
+  if (active !== null) return { size: toSize(active), source: 'resize' };
   if (session.sandboxCpu !== null || session.sandboxMemoryGb !== null) {
-    return heldSandboxSize(session);
+    return { size: heldSandboxSize(session), source: 'session' };
   }
   const fresh = session.sandboxId === null && session.latestCheckpointSeq === 0;
-  return fresh ? fallback : defaultSandboxSize();
+  return fresh
+    ? newSessionSize(provider, choice)
+    : { size: defaultSandboxSize(), source: 'legacy' };
 }
 
 /**
  * Size + template for a spawn: the closest built template satisfying the
- * wanted size, else the default size. A size preference never blocks a
- * session from starting.
+ * wanted size, else the base size. A size preference never blocks a session
+ * from starting (an explicit request was validated before: resolveRequestedSandboxSize).
  */
 export async function resolveSpawnSandbox(
   session: CodeSessionRow | null,
   provider: SandboxProvider,
-  projectSize: unknown
-): Promise<{ size: SandboxSize; templateId: string | null }> {
-  const wanted = await wantedSessionSize(session, projectSize);
+  choice: SpawnSizeChoice
+): Promise<{
+  size: SandboxSize;
+  templateId: string | null;
+  wanted: SandboxSize;
+  source: SandboxSizeSource;
+}> {
+  const { size: wanted, source } = await wantedSessionSize(session, provider, choice);
   const size = closestAvailableSize(provider, wanted) ?? defaultSandboxSize();
   if (!sameSize(size, wanted)) {
     log.warn('No template built for the wanted sandbox size; using the closest built one', {
@@ -359,5 +437,104 @@ export async function resolveSpawnSandbox(
       codeSessionId: session?.id,
     });
   }
-  return { size, templateId: sandboxTemplateFor(provider, size) };
+  return { size, templateId: sandboxTemplateFor(provider, size), wanted, source };
+}
+
+/**
+ * A spawn's explicit `sandbox_size` ({cpu?, memory_gb?}, at least one): the
+ * shape check only; resolveRequestedSandboxSize checks it against the built
+ * templates and the user's cap. Disk is not selectable: E2B fixes it per team.
+ */
+export const sandboxSizeRequestSchema = z
+  .object({
+    cpu: z.number().int().min(1).max(64).optional(),
+    memory_gb: z.number().int().min(1).max(256).optional(),
+  })
+  .strict()
+  .refine((size) => size.cpu !== undefined || size.memory_gb !== undefined, {
+    message: 'give cpu, memory_gb or both',
+  });
+
+export type SandboxSizeRequest = z.infer<typeof sandboxSizeRequestSchema>;
+
+/** A local (Mac) session has no sandbox, so a size request is refused, never ignored. */
+export function refuseLocalSandboxSize(
+  body: { target?: 'cloud' | 'local'; sandbox_size?: SandboxSizeRequest },
+  ctx: z.RefinementCtx
+): void {
+  if (body.target === 'local' && body.sandbox_size !== undefined) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['sandbox_size'],
+      message: "sandbox_size applies to target='cloud' only; a local session runs on the Mac",
+    });
+  }
+}
+
+/** Validated size of a create request, or null without one. */
+export async function requestedSandboxSize(
+  provider: SandboxProvider,
+  request: SandboxSizeRequest | undefined,
+  userId: string | undefined
+): Promise<SandboxSize | null> {
+  if (request === undefined) return null;
+  return resolveRequestedSandboxSize(
+    provider,
+    { cpu: request.cpu, memoryGb: request.memory_gb },
+    userId
+  );
+}
+
+/** A spawn's explicit sandbox_size that no built template within the user's cap satisfies. */
+export class SandboxSizeUnsupportedError extends Error {
+  readonly code = 'SANDBOX_SIZE_UNSUPPORTED';
+  constructor(
+    message: string,
+    readonly requested: SandboxSize,
+    readonly available: SandboxSize[],
+    readonly max: SandboxSize
+  ) {
+    super(message);
+    this.name = 'SandboxSizeUnsupportedError';
+  }
+}
+
+/**
+ * Validate a spawn's explicit `{cpu?, memoryGb?}`: a missing dimension takes the
+ * new-session default; the request must fit the user's cap and some built
+ * template must satisfy it (cpu ≥ N, memory ≥ M). Returns the request with both
+ * dimensions; the spawn runs on closestAvailableSize of it.
+ */
+export async function resolveRequestedSandboxSize(
+  provider: SandboxProvider,
+  requested: { cpu?: number; memoryGb?: number },
+  userId: string | undefined
+): Promise<SandboxSize> {
+  const max = userId !== undefined ? await maxSizeFor(userId) : undefined;
+  const fallback = newSessionDefaultSize(provider, max);
+  const want = {
+    cpu: requested.cpu ?? fallback.cpu,
+    memoryGb: requested.memoryGb ?? fallback.memoryGb,
+  };
+  const available = availableSizes(provider).filter(
+    (size) => max === undefined || fitsWithin(size, max)
+  );
+  const choices = available.map(sizeLabel).join('; ') || 'none';
+  if (max !== undefined && !fitsWithin(want, max)) {
+    throw new SandboxSizeUnsupportedError(
+      `Requested sandbox ${sizeLabel(want)} is over this account's limit of ${sizeLabel(max)}. Available: ${choices}.`,
+      want,
+      available,
+      max
+    );
+  }
+  if (closestAvailableSize(provider, want) === null) {
+    throw new SandboxSizeUnsupportedError(
+      `No ${provider} sandbox of at least ${sizeLabel(want)} is built. Available: ${choices}.`,
+      want,
+      available,
+      max ?? want
+    );
+  }
+  return want;
 }

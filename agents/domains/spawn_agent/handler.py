@@ -1222,6 +1222,9 @@ class SpawnAgentManager(ToolManager):
             code_tool_call["code_session_id"] = tool_call["code_session_id"]
         if tool_call.get("target"):
             code_tool_call["target"] = tool_call["target"]
+        if isinstance(tool_call.get("sandbox_size"), dict):
+            # The root's initial sandbox size (validated by the backend).
+            code_tool_call["sandbox_size"] = tool_call["sandbox_size"]
         if tool_call.get("task_name"):
             # Stored on the code task row: the agents list shows it as the title.
             code_tool_call["task_name"] = tool_call["task_name"]

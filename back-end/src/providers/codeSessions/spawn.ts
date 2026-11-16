@@ -53,6 +53,7 @@ import {
   CODE_SANDBOX_IDLE_TIMEOUT_MS,
   CodeSessionHeldError,
   CodeSessionPauseUnconfirmedError,
+  type SpawnSizingReport,
 } from '../e2bCodeSessionSandbox';
 import {
   revertCodeSessionProvider,
@@ -60,7 +61,7 @@ import {
   type SpawnCodeSession,
 } from './usageLimit';
 import { pendingResizeForTask, sizeView, type SizeView } from './sandboxResize';
-import type { SandboxSize } from './sandboxSize';
+import { SandboxSizeUnsupportedError, type SandboxSize } from './sandboxSize';
 import {
   codeResourceDeps,
   type CodeResourceDeps,
@@ -90,6 +91,19 @@ export function codeSessionHttpError(
   }
   if (error instanceof E2BSandboxCapacityError) {
     return { status: error.statusCode, body: { error: error.message, code: error.code } };
+  }
+  if (error instanceof SandboxSizeUnsupportedError) {
+    // The root asked for a size no built template within the user's cap satisfies.
+    return {
+      status: 400,
+      body: {
+        error: error.message,
+        code: error.code,
+        requested: sizeView(error.requested),
+        available: error.available.map(sizeView),
+        max: sizeView(error.max),
+      },
+    };
   }
   if (error instanceof GithubRateLimitedError) {
     return {
@@ -171,6 +185,7 @@ type SpawnCreateResult = {
   resumedFrom?: string;
   cliSessionId?: string | null;
   sandboxSize?: SandboxSize | null;
+  sandboxSizing?: SpawnSizingReport | null;
   historyEvents?: number;
   startup?: { wsReadyMs: number; cloneMs: number | null };
 };
@@ -370,12 +385,23 @@ async function createSpawnTask<T extends SpawnCreateResult>(
         session.sandboxSize !== undefined && session.sandboxSize !== null
           ? sizeView(session.sandboxSize)
           : null,
+      sandbox_sizing: sizingFields(session),
       history_events: session.historyEvents ?? 0,
       startup:
         session.startup !== undefined
           ? { ws_ready_ms: session.startup.wsReadyMs, clone_ms: session.startup.cloneMs }
           : null,
     },
+  };
+}
+
+function sizingFields(session: SpawnCreateResult): CodeSessionSpawnFields['sandbox_sizing'] {
+  const report = session.sandboxSizing ?? null;
+  if (report === null) return null;
+  return {
+    requested: report.requested !== null ? sizeView(report.requested) : null,
+    initial: session.sandboxSize ? sizeView(session.sandboxSize) : null,
+    source: report.source,
   };
 }
 
@@ -400,6 +426,17 @@ export interface CodeSessionSpawnFields {
   provider_handoff: boolean;
   /** vCPUs / memory of the E2B sandbox (C16); null for a local session. */
   sandbox_size: SizeView | null;
+  /**
+   * Requested vs observed size: `requested` is the spawn's explicit sandbox_size
+   * (null: none), `initial` the size this spawn's sandbox started on (null:
+   * unknown or local), `source` where that size came from. A resumed session
+   * keeps its size, so a request it did not apply reads source 'session'.
+   */
+  sandbox_sizing: {
+    requested: SizeView | null;
+    initial: SizeView | null;
+    source: SpawnSizingReport['source'];
+  } | null;
   /**
    * resumed_from=live_cli: the ws-server's events before this spawn's goal turn
    * (the earlier turns of the live CLI); the monitor treats them as history.

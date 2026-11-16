@@ -69,6 +69,7 @@ async function createSessionForTarget(body: unknown) {
     task_name,
     cli_settings,
     resume_config,
+    sandbox_size,
   } = createSessionSchema.parse(body);
   if (target === 'local') {
     const local = await createLocalCodeSessionResponse({
@@ -99,6 +100,7 @@ async function createSessionForTarget(body: unknown) {
     task_name,
     cli_settings,
     resume_config,
+    sandbox_size,
   });
 }
 

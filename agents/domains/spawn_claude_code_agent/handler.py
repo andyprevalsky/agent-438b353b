@@ -30,6 +30,7 @@ from domains.spawn_claude_code_agent.config import (
     E2B_CAPACITY_EXHAUSTED_CODE,
     GITHUB_RATE_LIMITED_CODE,
     LOCAL_TARGET_UNAVAILABLE_CODE,
+    SANDBOX_SIZE_UNSUPPORTED_CODE,
 )
 from domains.spawn_claude_code_agent.service import (
     close_detached_code_session_activity,
@@ -238,6 +239,22 @@ def _local_target_unavailable(error: BaseException) -> Optional[ApplicationError
 def _e2b_capacity_exhausted(error: BaseException) -> Optional[ApplicationError]:
     """E2B's concurrent-sandbox limit refusal: a hard failure, never a soft retry hint."""
     return _typed_application_error(error, E2B_CAPACITY_EXHAUSTED_CODE)
+
+
+def _sandbox_size_unsupported(error: BaseException) -> Optional[ApplicationError]:
+    return _typed_application_error(error, SANDBOX_SIZE_UNSUPPORTED_CODE)
+
+
+def requested_sandbox_size(value: Any) -> Optional[Dict[str, int]]:
+    """The spawn's ``sandbox_size`` as ``{cpu?, memory_gb?}`` (positive ints only), or None."""
+    if not isinstance(value, dict):
+        return None
+    size = {
+        key: value[key]
+        for key in ("cpu", "memory_gb")
+        if isinstance(value.get(key), int) and not isinstance(value.get(key), bool) and value[key] > 0
+    }
+    return size or None
 
 
 def _github_rate_limited(error: BaseException) -> Optional[ApplicationError]:
@@ -450,6 +467,10 @@ class SpawnClaudeCodeAgentManager(ToolManager):
         if isinstance(task_name, str) and task_name:
             # Rides in the request dict so the activity's positional arguments are unchanged.
             code_session_request = {**(code_session_request or {}), "task_name": task_name}
+        sandbox_size = requested_sandbox_size(tool_call.get("sandbox_size"))
+        if sandbox_size:
+            # The root's initial sandbox size; the backend validates it (new sessions only).
+            code_session_request = {**(code_session_request or {}), "sandbox_size": sandbox_size}
         resume_cli_settings = tool_call.get("_resume_cli_settings")
         if isinstance(resume_cli_settings, dict) and resume_cli_settings:
             # The model / effort / speed the person picked on the turn that resumes it.
@@ -513,6 +534,22 @@ class SpawnClaudeCodeAgentManager(ToolManager):
                     "code_provider": code_provider,
                     "error_code": GITHUB_REPO_REF_DENIED_CODE,
                     "code_agent": _failed_code_agent(target_info, conflict_message),
+                },
+            )
+            return
+        if code_session is None and requested_target == CODE_TARGET_LOCAL and sandbox_size:
+            # A Mac run has no sandbox: refuse the size instead of silently dropping it.
+            size_message = "sandbox_size applies to target='cloud' only; a local run uses the Mac as it is."
+            yield ToolEvent(
+                type=EventType.POST_MESSAGE,
+                title="Code session failed",
+                message=size_message,
+                status=MessageStatus.ERROR,
+                metadata={
+                    "toolName": "spawn_claude_code_agent",
+                    "code_provider": code_provider,
+                    "error_code": SANDBOX_SIZE_UNSUPPORTED_CODE,
+                    "code_agent": _failed_code_agent(target_info, size_message),
                 },
             )
             return
@@ -974,6 +1011,30 @@ class SpawnClaudeCodeAgentManager(ToolManager):
                         "code_provider": code_provider,
                         "error_code": E2B_CAPACITY_EXHAUSTED_CODE,
                         "code_agent": _failed_code_agent(target_info, capacity.message),
+                    },
+                )
+                return
+
+            size_unsupported = _sandbox_size_unsupported(e)
+            if size_unsupported is not None:
+                # The root asked for a size no built sandbox within the user's cap
+                # satisfies: fail with the backend's message (it lists the sizes).
+                logger.error(
+                    "[ClaudeCode] Requested sandbox size unsupported; failing the tool call",
+                    agent_id=agent_id,
+                    code_provider=code_provider,
+                    sandbox_size=sandbox_size,
+                )
+                yield ToolEvent(
+                    type=EventType.POST_MESSAGE,
+                    title="Code session failed",
+                    message=size_unsupported.message,
+                    status=MessageStatus.ERROR,
+                    metadata={
+                        "toolName": "spawn_claude_code_agent",
+                        "code_provider": code_provider,
+                        "error_code": SANDBOX_SIZE_UNSUPPORTED_CODE,
+                        "code_agent": _failed_code_agent(target_info, size_unsupported.message),
                     },
                 )
                 return

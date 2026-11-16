@@ -77,6 +77,7 @@ async function main() {
       heldSandboxSize: () => ({ cpu: 2, memoryGb: 4 }),
       sameSize: () => true,
       defaultSandboxSize: () => ({ cpu: 2, memoryGb: 4 }),
+      maxSizeFor: async () => ({ cpu: 8, memoryGb: 8 }),
     },
   });
   await mock.module('../../providers/nativeCliTemplateBuilder', {

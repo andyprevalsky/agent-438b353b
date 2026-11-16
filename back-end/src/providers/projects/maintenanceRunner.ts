@@ -272,10 +272,22 @@ async function startSandbox(
     timeoutMs: maintenanceLeaseMs(project),
     metadata: { roseProjectId: project.id, roseMaintenanceRunId: run.id },
   };
-  if (run.fromSnapshotId !== null) {
+  const snapshotSize = snapshotSizeOf(project);
+  // A snapshot of another size than the project now wants (its sandboxSize
+  // changed, or the default was raised) is rebuilt from the sized base template
+  // instead of carrying the old size forward.
+  const outdated =
+    snapshotSize !== null &&
+    (snapshotSize.cpu !== base.size.cpu || snapshotSize.memoryGb !== base.size.memoryGb);
+  if (run.fromSnapshotId !== null && outdated) {
+    out.line(
+      `the latest snapshot is ${snapshotSize.cpu} vCPU / ${snapshotSize.memoryGb} GB; rebuilding at ${base.size.cpu} vCPU / ${base.size.memoryGb} GB from the base template`
+    );
+  }
+  if (run.fromSnapshotId !== null && !outdated) {
     try {
       const sandbox = await deps.createSandbox(run.fromSnapshotId, opts);
-      return { sandbox, fromSnapshot: true, snapshotSize: snapshotSizeOf(project) };
+      return { sandbox, fromSnapshot: true, snapshotSize };
     } catch (error) {
       out.line(
         `the latest snapshot could not start (${error instanceof Error ? error.message : String(error)}); starting from the base template`

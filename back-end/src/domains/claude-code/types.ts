@@ -10,7 +10,13 @@ import {
   type CodeAgentResumeConfig,
 } from '../../providers/codeAgentResumeConfig';
 import type { FilePointer } from '../../providers/storage';
+import type { CodeSessionSpawnFields } from '../../providers/codeSessions/spawn';
 import type { ProjectRestoreReport } from '../../providers/projects/types';
+import {
+  refuseLocalSandboxSize,
+  sandboxSizeRequestSchema,
+  type SandboxSizeRequest,
+} from '../../providers/codeSessions/sandboxSize';
 
 // ---------------------------------------------------------------------------
 // Zod schemas
@@ -56,8 +62,11 @@ export const createSessionSchema = z
     // A resuming turn's model / effort / speed: the first resumed turn runs on them.
     cli_settings: codeCliSettingsSchema.optional(),
     resume_config: codeAgentResumeConfigSchema.optional(),
+    // Root-selected initial size of a NEW session's sandbox; a resumed session keeps its size.
+    sandbox_size: sandboxSizeRequestSchema.optional(),
   })
-  .superRefine(validateCodeResumeLease);
+  .superRefine(validateCodeResumeLease)
+  .superRefine(refuseLocalSandboxSize);
 
 export const closeSessionSchema = z.object({
   task_id: z.string().uuid(),
@@ -95,6 +104,8 @@ export interface CreateSessionParams {
   /** A resuming turn's model / effort / speed for the first resumed turn. */
   cli_settings?: z.infer<typeof codeCliSettingsSchema>;
   resume_config?: CodeAgentResumeConfig;
+  /** Root-selected initial sandbox size (a new session only). */
+  sandbox_size?: SandboxSizeRequest;
 }
 
 export interface CreateSessionResult {
@@ -114,6 +125,8 @@ export interface CreateSessionResult {
   provider_handoff: boolean;
   /** vCPUs / memory of the E2B sandbox (C16); null for a local session. */
   sandbox_size: { cpu: number; memory_gb: number } | null;
+  /** Requested vs observed size and its source (null for a local session). */
+  sandbox_sizing: CodeSessionSpawnFields['sandbox_sizing'];
   /** Restore summary when the session materialized a Project (PJ3). */
   project: ProjectRestoreReport | null;
   /** Live dev-server preview URL (Rose dev accounts, A1); null otherwise. */

@@ -38,6 +38,7 @@ import {
 } from '../../domains/projects/maintenanceService';
 import { prisma } from '../../providers/database';
 import { acquireCodeSandbox } from '../../providers/e2bCodeSessionSandbox';
+import { newSessionDefaultSize } from '../../providers/codeSessions/sandboxSize';
 import * as store from '../../providers/projects/maintenanceStore';
 import { githubSlotKey, nightlySlotKey } from '../../providers/projects/maintenanceSchedule';
 import type { ProjectWorkspace } from '../../providers/projects/types';
@@ -497,6 +498,33 @@ test('Snapshot now fast-forwards and snapshots without running the sync script',
   assert(installs(f) === 1, 'no install');
 });
 
+test('a snapshot of an outdated size is rebuilt from the sized base template', async () => {
+  const f = await fixture('outdated-size');
+  await runOnce(f);
+  assert(
+    JSON.stringify((await projectRow(f.projectId)).templateSnapshotSize) ===
+      JSON.stringify({ cpu: 2, memoryGb: 4 }),
+    'first snapshot at the base size'
+  );
+  // The default (or the project's size) was raised since the snapshot was built.
+  const runner = f.deps.runner;
+  f.deps.runner = () => ({
+    ...runner(),
+    baseTemplate: () => ({ templateId: 'base-c8-m8', size: { cpu: 8, memoryGb: 8 } }),
+  });
+  await runOnce(f);
+  const run = await lastRun(f.projectId);
+  assert(run.status === 'SUCCEEDED', `run ${run.status} ${run.error}`);
+  assert(f.fake.created[1] === 'base-c8-m8', `rebuilt from the sized base: ${f.fake.created}`);
+  assert(
+    JSON.stringify((await projectRow(f.projectId)).templateSnapshotSize) ===
+      JSON.stringify({ cpu: 8, memoryGb: 8 }),
+    'the new snapshot records the new size'
+  );
+  await runOnce(f);
+  assert(f.fake.created[2] === 'snap-2', `a matching snapshot is reused: ${f.fake.created}`);
+});
+
 test('a run without a repository or a sync script is refused before any sandbox exists', async () => {
   const noRepo = await fixture('no-repo', { repo: false });
   assert((await runOnce(noRepo)).kind === 'ineligible', 'no repository');
@@ -516,7 +544,9 @@ test('a new session sandbox is created from the snapshot, with the base template
     return { sandboxId: `fake-${created.length}` } as unknown as Sandbox;
   }) as unknown as typeof Sandbox.create;
   try {
-    const snapshot = { id: 'snap-7', size: { cpu: 2, memoryGb: 4 } };
+    // A snapshot at the size a new session resolves to (one of another size is skipped:
+    // code-session-sizing.blackbox.ts).
+    const snapshot = { id: 'snap-7', size: newSessionDefaultSize('claude') };
     const viaSnapshot = await acquireCodeSandbox(null, 'base-tpl', {}, 'Test', {
       provider: 'claude',
       snapshot,

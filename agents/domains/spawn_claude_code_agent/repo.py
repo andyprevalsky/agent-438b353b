@@ -25,6 +25,7 @@ from domains.spawn_claude_code_agent.config import (
     E2B_CAPACITY_EXHAUSTED_CODE,
     GITHUB_RATE_LIMITED_CODE,
     LOCAL_TARGET_UNAVAILABLE_CODE,
+    SANDBOX_SIZE_UNSUPPORTED_CODE,
 )
 from helpers.activity_heartbeat import safe_heartbeat
 from helpers.github_repo_ref import GITHUB_REPO_REF_DENIED_CODE, repo_ref_denied_message
@@ -343,8 +344,13 @@ async def create_e2b_session(
     task_name: Optional[str] = None,
     cli_settings: Optional[dict[str, Any]] = None,
     resume_config: Optional[dict[str, Any]] = None,
+    sandbox_size: Optional[dict[str, int]] = None,
 ) -> dict[str, Any]:
     """Create an E2B sandbox session via back-end API.
+
+    ``sandbox_size`` (``{cpu?, memory_gb?}``) is the root's initial size for a new
+    session; a size no built template within the user's cap satisfies answers 400
+    ``SANDBOX_SIZE_UNSUPPORTED``, raised non-retryable with the available sizes.
 
     ``code_session_id`` resumes that persistent code session; omitted, the
     backend resumes the spawning agent's latest session for the repo.
@@ -397,6 +403,8 @@ async def create_e2b_session(
         if fresh_conversation:
             # Keep the session's sandbox and files; start a new CLI conversation.
             create_payload["fresh_conversation"] = True
+        if sandbox_size:
+            create_payload["sandbox_size"] = sandbox_size
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(CODE_SESSION_CREATE_TIMEOUT_S, connect=10.0)) as client:
 
@@ -433,6 +441,16 @@ async def create_e2b_session(
                 raise ApplicationError(
                     repo_ref_denied_message(create_payload["github_repo_ref"], str(body.get("error") or "")),
                     type=GITHUB_REPO_REF_DENIED_CODE,
+                    non_retryable=True,
+                )
+
+        if response.status_code == 400:
+            body = _json_or_empty(response)
+            if body.get("code") == SANDBOX_SIZE_UNSUPPORTED_CODE and isinstance(body.get("error"), str):
+                raise ApplicationError(
+                    body["error"],
+                    {"requested": body.get("requested"), "available": body.get("available")},
+                    type=SANDBOX_SIZE_UNSUPPORTED_CODE,
                     non_retryable=True,
                 )
 

@@ -1251,6 +1251,29 @@ _GITHUB_REPO_REF_DESCRIPTION = (
 )
 
 
+class CodeSandboxSize(BaseModel):
+    """Initial vCPUs / memory of a code agent's cloud sandbox."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    cpu: Optional[int] = Field(default=None, ge=1, le=64, description="vCPUs.")
+    memory_gb: Optional[int] = Field(default=None, ge=1, le=256, description="Memory in GB.")
+
+    @model_validator(mode="after")
+    def check_dimension(self) -> "CodeSandboxSize":
+        if self.cpu is None and self.memory_gb is None:
+            raise ValueError("sandbox_size needs cpu, memory_gb or both.")
+        return self
+
+
+_SANDBOX_SIZE_DESCRIPTION = (
+    "Optional when type='code' with target='cloud'; ignored for every other type. Initial vCPUs / "
+    "memory of a NEW code session's sandbox; the closest built size that satisfies both is used. "
+    "Omit it to use the project's size or the default. A resumed session keeps the size it holds. "
+    "An unbuilt or over-limit size fails with the available sizes. Disk size is not selectable."
+)
+
+
 class SpawnAgentTool(BaseModel):
     """Spawn an autonomous agent; type selects capabilities and per-type required fields.
 
@@ -1340,6 +1363,7 @@ class SpawnAgentTool(BaseModel):
             "shared (requires an owned connected Mac; multiple Macs require explicit device selection), 'cloud' (default) runs it in a sandbox."
         ),
     )
+    sandbox_size: Optional[CodeSandboxSize] = Field(default=None, description=_SANDBOX_SIZE_DESCRIPTION)
     start_phase: Optional[Literal["PLAN", "EXECUTE"]] = Field(
         default=None,
         description=(
@@ -1539,6 +1563,7 @@ class SpawnAgentToolNoGP(BaseModel):
             "shared (requires an owned connected Mac; multiple Macs require explicit device selection), 'cloud' (default) runs it in a sandbox."
         ),
     )
+    sandbox_size: Optional[CodeSandboxSize] = Field(default=None, description=_SANDBOX_SIZE_DESCRIPTION)
     context_gates: Optional[Dict[str, bool]] = Field(
         default=None,
         description=(
