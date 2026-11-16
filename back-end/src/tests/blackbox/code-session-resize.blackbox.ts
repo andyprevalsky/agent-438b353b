@@ -5,8 +5,11 @@
  *   rose env size ──POST /api/agent-tools/:agentId/environment/size──► CodeSessionResize PENDING (202)
  *   keepalive ──► resize_requested ──► performSandboxResize
  *     stop CLI → checkpoint held fake sandbox → Sandbox.create(<size's template>)
- *     → restore (branch, commits, uncommitted + untracked files, CLI log) → kill held
+ *     → restore exactly that checkpoint (branch, commits, uncommitted + untracked files,
+ *     CLI log) → validate → cut over (held paused) → target serves → kill held
  *     → `--resume` turn naming the new size; retry returns the same task
+ *   faults (code-session-resize-faults.cases.ts): disk full, restore failure, interruption,
+ *   rollback, backend restart, duplicate requests
  *   guards: reason (400), cap per dimension (403), in flight / cooldown / reverse per
  *   dimension (409), unchanged (200), local target not applicable (409)
  *   rose env status: size + top 5 processes by memory and CPU
@@ -18,12 +21,10 @@
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { existsSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
 import { after, before, test } from 'node:test';
-import { Sandbox, SandboxNotFoundError } from 'e2b';
-import { config } from 'dotenv';
+import { SandboxNotFoundError } from 'e2b';
 import { prisma } from '../../providers/database';
 import { NO_CODE_RESOURCES } from '../../providers/codeSessions/sandboxResources';
 import { mintAgentToolsToken } from '../../providers/agentTools/token';
@@ -32,7 +33,6 @@ import {
   closeTaskForResize,
   performSandboxResize,
   requestSandboxResize,
-  SandboxResizeError,
   stopSandboxCli,
 } from '../../providers/codeSessions/sandboxResize';
 import {
@@ -48,209 +48,27 @@ import {
 } from '../../providers/e2bCodeSessionSandbox';
 import { writeUserUiWorkspaceToSandbox } from '../../providers/userUi/workspace';
 import { assertResizeMigrationIsolation } from './code-session-resize-migration.cases';
-
-config();
-
-const baseUrl = process.env.TEST_BASE_URL || 'http://localhost:3001';
-const apiKey = process.env.BACKEND_API_KEY || '';
-const fixtureDir = mkdtempSync(join(tmpdir(), 'code-session-resize-'));
-const userId = `resize-user-${randomUUID()}`;
-const agentId = randomUUID();
-const cliSessionId = randomUUID();
-const roseCli = join(__dirname, '../../assets/rose-tools/rose.cjs');
-const TEMPLATES = {
-  claude: { '2x4': 'tpl-c2-m4', '2x8': 'tpl-c2-m8', '8x4': 'tpl-c8-m4', '8x8': 'tpl-c8-m8' },
-};
-const ENV_KEYS = [
-  'CODE_SESSION_STORAGE_BACKEND',
-  'CODE_SESSION_STORAGE_LOCAL_DIR',
-  'E2B_SANDBOX_TEMPLATES',
-  'CODE_SANDBOX_GRID',
-  'CODE_SANDBOX_MAX_CPU',
-  'CODE_SANDBOX_MAX_MEMORY_GB',
-] as const;
-const savedEnv = Object.fromEntries(ENV_KEYS.map((key) => [key, process.env[key]]));
-const originalConnect = Sandbox.connect.bind(Sandbox);
-const originalCreate = Sandbox.create.bind(Sandbox);
-
-function git(cwd: string, ...args: string[]): string {
-  return execFileSync('git', args, { cwd, encoding: 'utf8' }).trim();
-}
-
-/** `<home>/workspace` on rose/feature-1 with a local commit, an uncommitted edit, an untracked file and a CLI log. */
-function seedWorkspace(home: string): void {
-  const origin = join(fixtureDir, `origin-${randomUUID()}.git`);
-  execFileSync('git', ['init', '-q', '--bare', '-b', 'main', origin]);
-  const workspace = join(home, 'workspace');
-  mkdirSync(home, { recursive: true });
-  execFileSync('git', ['clone', '-q', origin, workspace], { stdio: 'ignore' });
-  git(workspace, 'config', 'user.name', 'Test');
-  git(workspace, 'config', 'user.email', 'test@example.com');
-  git(workspace, 'checkout', '-q', '-b', 'main');
-  writeFileSync(join(workspace, 'README.md'), 'line one\n');
-  git(workspace, 'add', '-A');
-  git(workspace, 'commit', '-q', '-m', 'initial');
-  git(workspace, 'push', '-q', 'origin', 'main');
-  git(workspace, 'checkout', '-q', '-b', 'rose/feature-1');
-  writeFileSync(join(workspace, 'feature.txt'), 'committed locally\n');
-  git(workspace, 'add', 'feature.txt');
-  git(workspace, 'commit', '-q', '-m', 'local commit');
-  writeFileSync(join(workspace, 'README.md'), 'line one\nuncommitted edit\n');
-  writeFileSync(join(workspace, 'untracked.txt'), 'untracked file\n');
-  const logDir = join(home, '.claude', 'projects', '-home-user-workspace');
-  mkdirSync(logDir, { recursive: true });
-  writeFileSync(
-    join(logDir, `${cliSessionId}.jsonl`),
-    `${JSON.stringify({ type: 'user', timestamp: new Date().toISOString(), message: { content: 'build it' } })}\n`
-  );
-}
-
-/** E2B sandbox stand-in over a local HOME: commands and files map /home/user → home. */
-function fakeSandbox(home: string, sandboxId: string) {
-  const map = (value: string) => value.split('/home/user').join(home);
-  const calls = { paused: 0, killed: 0, commands: [] as string[] };
-  const write = async (path: string, data: ArrayBuffer | Blob | string) => {
-    mkdirSync(dirname(map(path)), { recursive: true });
-    const bytes =
-      typeof data === 'string'
-        ? Buffer.from(data)
-        : data instanceof ArrayBuffer
-          ? Buffer.from(new Uint8Array(data))
-          : Buffer.from(await data.arrayBuffer());
-    writeFileSync(map(path), bytes);
-  };
-  const sandbox = {
-    sandboxId,
-    commands: {
-      run: async (cmd: string, opts?: { cwd?: string }) => {
-        calls.commands.push(cmd);
-        const result = spawnSync('bash', ['-c', map(cmd)], {
-          cwd: map(opts?.cwd ?? '/home/user'),
-          encoding: 'utf8',
-          env: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: home, GIT_TERMINAL_PROMPT: '0' },
-        });
-        return { exitCode: result.status ?? 1, stdout: result.stdout, stderr: result.stderr };
-      },
-    },
-    files: {
-      read: async (path: string, opts?: { format?: string }) => {
-        const data = readFileSync(map(path));
-        return opts?.format === 'text' ? data.toString('utf8') : new Uint8Array(data);
-      },
-      write: async (
-        pathOrEntries: string | Array<{ path: string; data: ArrayBuffer | Blob | string }>,
-        data?: ArrayBuffer | Blob | string
-      ) => {
-        if (Array.isArray(pathOrEntries)) {
-          for (const entry of pathOrEntries) await write(entry.path, entry.data);
-          return;
-        }
-        await write(pathOrEntries, data ?? '');
-      },
-    },
-    pause: async () => {
-      calls.paused += 1;
-      return true;
-    },
-    kill: async () => {
-      calls.killed += 1;
-    },
-  };
-  return { sandbox: sandbox as unknown as Sandbox, calls };
-}
-
-function patchE2b(
-  connect: (id: string) => Promise<Sandbox>,
-  create: (templateId: string) => Promise<Sandbox>
-): void {
-  (Sandbox as unknown as { connect: typeof connect }).connect = connect;
-  (Sandbox as unknown as { create: typeof create }).create = create;
-}
-
-function restoreE2b(): void {
-  (Sandbox as unknown as { connect: unknown }).connect = originalConnect;
-  (Sandbox as unknown as { create: unknown }).create = originalCreate;
-}
-
-async function http(method: string, path: string, init: { body?: unknown; token?: string } = {}) {
-  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-  if (init.token !== undefined) headers.Authorization = `Bearer ${init.token}`;
-  else Object.assign(headers, { 'X-API-Key': apiKey, 'X-User-Id': userId });
-  const response = await fetch(`${baseUrl}${path}`, {
-    method,
-    headers,
-    ...(init.body !== undefined ? { body: JSON.stringify(init.body) } : {}),
-  });
-  const text = await response.text();
-  let data: unknown = text;
-  try {
-    data = JSON.parse(text);
-  } catch {
-    // keep text
-  }
-  return { status: response.status, data: data as Record<string, unknown> };
-}
-
-/** A persistent E2B session at 2 vCPU / 4 GB with an ACTIVE task. */
-async function sessionWithTask(options: { sandboxId?: string; held?: [number, number] } = {}) {
-  const sandboxId = options.sandboxId ?? `sb-${randomUUID()}`;
-  const session = await prisma.codeSession.create({
-    data: {
-      userId,
-      rootAgentId: agentId,
-      ownerAgentId: agentId,
-      repoKey: `resize-${randomUUID()}`,
-      branch: 'rose/feature-1',
-      mergeTarget: 'main',
-      sandboxKind: 'e2b',
-      sandboxId,
-      sandboxCpu: options.held?.[0] ?? 2,
-      sandboxMemoryGb: options.held?.[1] ?? 4,
-      leaseOwner: `tool:${agentId}:call-1`,
-      leaseExpiresAt: new Date(Date.now() + 60 * 60_000),
-    },
-  });
-  const task = await prisma.claudeCodeSession.create({
-    data: {
-      agentId,
-      sandboxId,
-      streamUrl: `wss://${sandboxId}`,
-      goal: 'Build the feature',
-      status: 'ACTIVE',
-      codeSessionId: session.id,
-      codeProvider: 'claude',
-    },
-  });
-  return { session, task, sandboxId };
-}
-
-async function expectResizeError(
-  promise: Promise<unknown>,
-  status: number,
-  code: string
-): Promise<SandboxResizeError> {
-  try {
-    await promise;
-  } catch (err) {
-    assert.ok(err instanceof SandboxResizeError, String(err));
-    assert.equal(err.status, status, err.message);
-    assert.equal(err.code, code, err.message);
-    return err;
-  }
-  assert.fail(`expected ${status} ${code}`);
-}
-
-/** Finish a request the way performSandboxResize does, without a sandbox. */
-async function completeResize(requestId: string, codeSessionId: string): Promise<void> {
-  const row = await prisma.codeSessionResize.update({
-    where: { id: requestId },
-    data: { status: 'DONE', completedAt: new Date() },
-  });
-  await prisma.codeSession.update({
-    where: { id: codeSessionId },
-    data: { sandboxCpu: row.toCpu, sandboxMemoryGb: row.toMemoryGb },
-  });
-}
+import { registerResizeFaultTests } from './code-session-resize-faults.cases';
+import {
+  agentId,
+  baseUrl,
+  cliSessionId,
+  completeResize,
+  ENV_KEYS,
+  expectResizeError,
+  fakeSandbox,
+  fixtureDir,
+  git,
+  http,
+  patchE2b,
+  restoreE2b,
+  roseCli,
+  savedEnv,
+  seedWorkspace,
+  sessionWithTask,
+  TEMPLATES,
+  userId,
+} from './code-session-resize.support';
 
 before(async () => {
   process.env.CODE_SESSION_STORAGE_BACKEND = 'local';
@@ -367,8 +185,8 @@ test('resize round trip: new sandbox from the size template keeps branch, files 
     });
     clock.end = performance.now();
     console.log(
-      `  resize timing (fake E2B): stop+checkpoint ${Math.round(clock.create - clock.start)} ms, ` +
-        `create+restore+kill ${Math.round(clock.acquired - clock.create)} ms, ` +
+      `  resize timing (fake E2B): stop+preflight+checkpoint ${Math.round(clock.create - clock.start)} ms, ` +
+        `create+restore+validate+cut-over ${Math.round(clock.acquired - clock.create)} ms, ` +
         `total ${Math.round(clock.end - clock.start)} ms`
     );
 
@@ -378,7 +196,10 @@ test('resize round trip: new sandbox from the size template keeps branch, files 
       held.calls.commands.some((cmd) => cmd.includes('pgrep -f')),
       'the old CLI is stopped first'
     );
-    assert.equal(held.calls.killed, 1, 'the held sandbox is killed after the restore');
+    assert.equal(held.calls.killed, 1, 'the held sandbox is killed after the target served');
+    assert.ok(held.calls.paused >= 1, 'it was paused (kept) at cut-over until then');
+    assert.equal(typeof result.request.request_to_settled_ms, 'number');
+    assert.ok((result.request.apply_ms ?? -1) >= 0, 'request-to-ready telemetry');
     const session1 = result.session as { cli_session_id?: string; resumed_from?: string };
     assert.equal(session1.resumed_from, 'checkpoint');
     assert.equal(session1.cli_session_id, cliSessionId, 'the CLI conversation resumes');
@@ -428,6 +249,8 @@ test('resize round trip: new sandbox from the size template keeps branch, files 
     restoreE2b();
   }
 });
+
+registerResizeFaultTests();
 
 test('guards: reason 400, per-dimension cap 403, in flight / cooldown / reverse 409, unchanged 200', async () => {
   process.env.CODE_SANDBOX_GRID = JSON.stringify({ cpu: [2, 4, 8], memoryGb: [4, 6, 8] });

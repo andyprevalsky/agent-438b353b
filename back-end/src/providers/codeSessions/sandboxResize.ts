@@ -38,7 +38,16 @@ import {
   type SandboxSize,
   type SizeDimension,
 } from './sandboxSize';
-import type { CodeSessionRow } from './store';
+import {
+  newResizeTransaction,
+  resizeDurations,
+  resizeFailureCode,
+  resizeTelemetry,
+  runInResizeTransaction,
+  timedPhase,
+  type ResizeTransaction,
+} from './resizeTransaction';
+import { recordSandbox, type CodeSessionRow } from './store';
 
 const log = createLogger('CodeSandboxResize');
 
@@ -82,6 +91,12 @@ export interface ResizeRequestView {
   completed_at: string | null;
   new_task_id: string | null;
   error: string | null;
+  /** requestedAt → startedAt; null until claimed. */
+  queue_ms: number | null;
+  /** startedAt → completedAt; null until settled. */
+  apply_ms: number | null;
+  /** requestedAt → completedAt: request to ready (done) or to failure. */
+  request_to_settled_ms: number | null;
 }
 
 export function sizeView(size: SandboxSize): SizeView {
@@ -99,6 +114,7 @@ export function resizeView(row: ResizeRow): ResizeRequestView {
     completed_at: row.completedAt?.toISOString() ?? null,
     new_task_id: row.newTaskId,
     error: row.error,
+    ...resizeDurations(row),
   };
 }
 
@@ -273,6 +289,9 @@ export async function requestSandboxResize(params: {
         completed_at: null,
         new_task_id: null,
         error: null,
+        queue_ms: null,
+        apply_ms: null,
+        request_to_settled_ms: null,
         message: `This session already runs on ${sizeLabel(held)}, the closest size to that request.`,
       },
     };
@@ -389,6 +408,7 @@ export function resizedTurn(row: ResizeRow): string {
       `as you requested ("${row.reason}").`,
     'This is a new sandbox restored from your session: same branch, commits, uncommitted files and conversation.',
     'Processes that were running (dev servers, watchers, builds) were stopped; start again the ones you need.',
+    'Dependency and build directories (node_modules, virtualenvs, dist/build outputs, caches) are not carried over; reinstall or rebuild what you need.',
     'Continue the task where you left off. Downsize with `rose env size` when the heavy phase is over.',
   ].join('\n');
 }
@@ -483,19 +503,29 @@ export async function performSandboxResize<T extends ResizeSessionResult>(params
     leaseOwner: session.leaseOwner ?? `resize:${row.id}`,
     projectId: task.projectId,
   };
+  const tx = newResizeTransaction(row.id);
   if (task.status !== 'CLOSED') {
     // Stop the old CLI first so nothing changes after the checkpoint.
-    await params.stopCli(task.sandboxId).catch((error: unknown) => {
-      log.warn('Stopping the CLI before a resize failed', {
-        taskId: task.id,
-        error: error instanceof Error ? error.message : String(error),
-      });
-    });
+    await timedPhase(
+      'stop',
+      () =>
+        params.stopCli(task.sandboxId).catch((error: unknown) => {
+          log.warn('Stopping the CLI before a resize failed', {
+            taskId: task.id,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }),
+      tx
+    );
     await params.closeTask(task.id);
   }
 
   try {
-    const created = await params.create({ ...input, goal: resizedTurn(row) });
+    const created = await runInResizeTransaction(tx, () =>
+      timedPhase('ready', () => params.create({ ...input, goal: resizedTurn(row) }))
+    );
+    // The new sandbox serves: only now does the original go.
+    await timedPhase('commit', () => commitResizeCutover(session.id, task.sandboxId, tx), tx);
     const updated = await prisma.codeSessionResize.update({
       where: { id: row.id },
       data: { status: 'DONE', newTaskId: created.task_id, completedAt: new Date() },
@@ -506,30 +536,117 @@ export async function performSandboxResize<T extends ResizeSessionResult>(params
       from: sizeKey(fromSize(row)),
       to: sizeKey(toSize(row)),
       newTaskId: created.task_id,
+      telemetry: resizeTelemetry(updated, tx, 'done', null),
     });
     return { resized: true, request: resizeView(updated), session: created };
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
+    const code = resizeFailureCode(error);
+    const message = `${code}: ${error instanceof Error ? error.message : String(error)}`;
     log.error('Sandbox resize failed; continuing on the previous size', {
       codeSessionId: session.id,
       requestId: row.id,
-      error: message,
+      error: message.slice(0, 500),
     });
-    await prisma.codeSessionResize.update({
+    const abandoned = await timedPhase(
+      'rollback',
+      () => rollbackResizeCutover(session.id, task.sandboxId, row, tx),
+      tx
+    );
+    const failed = await prisma.codeSessionResize.update({
       where: { id: row.id },
       data: { status: 'FAILED', error: message.slice(0, 500), completedAt: new Date() },
+    });
+    log.info('Sandbox resize settled', {
+      codeSessionId: session.id,
+      requestId: row.id,
+      telemetry: resizeTelemetry(failed, tx, abandoned !== null ? 'rolled_back' : 'failed', code),
     });
     const after = await prisma.codeSession.findUniqueOrThrow({ where: { id: session.id } });
     const created = await params.create({
       ...input,
       goal: resizeFailedTurn(row, message, heldSandboxSize(after)),
     });
+    if (abandoned !== null && abandoned !== created.sandbox_id) {
+      // The original serves again: the half-started target is no longer needed.
+      await killSandboxById(abandoned, session.id);
+    }
     const updated = await prisma.codeSessionResize.update({
       where: { id: row.id },
       data: { newTaskId: created.task_id },
     });
     return { resized: false, request: resizeView(updated), session: created };
   }
+}
+
+async function killSandboxById(sandboxId: string, codeSessionId: string): Promise<void> {
+  try {
+    await Sandbox.kill(sandboxId, { apiKey: process.env.E2B_API_KEY });
+  } catch (error) {
+    log.warn('Killing a sandbox after a resize failed', {
+      codeSessionId,
+      sandboxId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
+/**
+ * Commit: the session row names the new sandbox and it serves, so the original
+ * (the requesting task's sandbox) is killed. Durable across a backend restart:
+ * a re-run of a stale claim finds the original from the task row. Nothing is
+ * killed while the row still names the original.
+ */
+async function commitResizeCutover(
+  codeSessionId: string,
+  originalSandboxId: string,
+  tx: ResizeTransaction
+): Promise<void> {
+  const current = await prisma.codeSession.findUniqueOrThrow({ where: { id: codeSessionId } });
+  if (current.sandboxId === null || current.sandboxId === originalSandboxId) return;
+  if (tx.retained !== null && tx.retained.sandboxId === originalSandboxId) {
+    await tx.retained.kill().catch((error: unknown) => {
+      log.warn('Killing the original sandbox after a resize failed', {
+        codeSessionId,
+        sandboxId: originalSandboxId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    });
+  } else {
+    await killSandboxById(originalSandboxId, codeSessionId);
+  }
+  log.info('Resize committed; original sandbox released', {
+    codeSessionId,
+    previous: originalSandboxId,
+    sandboxId: current.sandboxId,
+  });
+}
+
+/**
+ * Rollback after a failed create: when the row was cut over to a target that
+ * never served while the original is retained (paused), the row names the
+ * original and its size again. Returns the abandoned target, which the caller
+ * kills only once the fallback spawn runs on the original.
+ */
+async function rollbackResizeCutover(
+  codeSessionId: string,
+  originalSandboxId: string,
+  row: ResizeRow,
+  tx: ResizeTransaction
+): Promise<string | null> {
+  if (tx.retained === null || tx.retained.sandboxId !== originalSandboxId) return null;
+  const current = await prisma.codeSession.findUniqueOrThrow({ where: { id: codeSessionId } });
+  if (current.sandboxId === originalSandboxId || current.sandboxId === null) return null;
+  await recordSandbox(codeSessionId, {
+    sandboxKind: 'e2b',
+    sandboxId: originalSandboxId,
+    size: fromSize(row),
+  });
+  log.warn('Resize rolled back to the original sandbox', {
+    codeSessionId,
+    sandboxId: originalSandboxId,
+    abandoned: current.sandboxId,
+  });
+  return current.sandboxId;
 }
 
 /** Stop the ws-server and its CLI in an E2B sandbox, leaving the sandbox (and its files) up. */

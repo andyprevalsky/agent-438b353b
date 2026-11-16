@@ -307,6 +307,15 @@ export async function restoreLatestCheckpoint(
 ): Promise<{ seq: number; cliSessionId: string | null } | null> {
   const verified = await loadNewestVerifiedCheckpoint(session);
   if (verified === null) return null;
+  return applyVerifiedCheckpoint(session, fs, verified);
+}
+
+/** Restore one verified checkpoint (a resize restores exactly the one it just took). */
+export async function applyVerifiedCheckpoint(
+  session: CodeSessionRow,
+  fs: CodeSessionFs,
+  verified: VerifiedCheckpoint
+): Promise<{ seq: number; cliSessionId: string | null }> {
   const { cliSessionId } = await applyCheckpoint(fs, verified, {
     authRemoteUrl: githubAuthRemoteUrl,
   });
